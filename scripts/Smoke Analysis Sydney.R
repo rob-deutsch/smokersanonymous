@@ -25,11 +25,18 @@ setDT(stations_loc)
 
 # Shapefiles for states and SA2 Units
 states <- st_read('M://finpoint19//R&D//Spatial Data//ABS_Shapefiles//State//STE_2016_AUST.shp')
-
 NSW <- states[states$STE_NAME16 == "New South Wales", ]
+
 rm(states)
 
 sa2 <- st_read('N:\\Perils20\\Climate\\Smoke\\Data\\1270055001_sa2_2016_aust_shape\\SA2_2016_AUST.shp')
+sa2 <- st_transform(sa2, crs_code)
+
+# Cut down to SA2 in NSW
+sa2_NSW <- st_join(st_transform(sa2, crs_code), st_transform(NSW, crs_code), join = st_intersects)
+sa2_NSW <- sa2_NSW[!is.na(sa2_NSW$STE_CODE16.y), 'SA2_MAIN16']
+
+rm(sa2)
 
 gc()
 
@@ -114,9 +121,13 @@ smoke_related_PM2.5_conc <- dcast(smoke_related_PM2.5_conc, location ~ smokey_fl
 
 #### Estimation of the population weighted mean concentrations
 
-sydney_area <- st_sfc(st_polygon(list(rbind(c(150, -34.6), c(151.8,-34.6), c(151.8, -32.8),c(150, -32.8), c(150, -34.6)))))
+bigger <- 0.18
 
-sydney_grid <- st_make_grid(sydney_area, n = 500, crs = crs_code, what = 'centers')
+sydney_area <- st_sfc(st_polygon(list(rbind(c(150-bigger, -34.6-bigger), c(151.8+bigger,-34.6-bigger), c(151.8+bigger, -32.8+bigger),
+                                            c(150-bigger, -32.8+bigger), c(150-bigger, -34.6-bigger)))))
+
+sydney_grid <- st_make_grid(sydney_area, n = 600, crs = crs_code, what = 'centers')
+
 st_crs(sydney_grid) <- crs_code
 
 # Cut down to grid points in NSW: remove those in sea for faster calculations
@@ -125,6 +136,8 @@ grid_NSW <- grid_NSW[!is.na(grid_NSW$STE_CODE16),]
 
 NSW_grid_proj <- st_sf(st_transform(grid_NSW, crs = crs_projected))
 NSW_grid_proj$id <- 1:nrow(NSW_grid_proj)
+
+st_write(NSW_grid_proj, 'N:\\Perils20\\Climate\\Smoke\\Data\\Output\\Grids.shp', delete_layer = T)
 
 stations_smoke <- merge(stations_smoke, smoke_related_PM2.5_conc[, c('location', '0', '1')], by = 'location')
 
@@ -180,6 +193,7 @@ gc()
 
 smoke_pts <- merge(smoke_pts, NSW_grid_DT, by = 'id', all.x = T)
 
+smoke_pts <- smoke_pts[!is.na(id),]
 
 ggplot(smoke_pts[Date == as.Date("2019-12-10"),], aes(x = X, y = Y, colour = weighted_smoke, fill = weighted_smoke)) +
   geom_point() +
@@ -197,12 +211,6 @@ non_smokey_baseline <- distances_melted[, .(non_smoky_weighted = sum(`0` * propo
 
 #### ---- SA2 level analysis ---- ####
 
-
-# Cut down to SA2 in NSW
-sa2_NSW <- st_join(sa2, NSW, join = st_intersects)
-sa2_NSW <- sa2_NSW[!is.na(sa2_NSW$STE_CODE16.y), 'SA2_MAIN16']
-sa2_NSW <- st_transform(sa2_NSW, crs_code)
-
 intersections <- as.data.table(st_join(grid_NSW, sa2_NSW, join = st_intersects))
 intersections <- cbind(intersections[, SA2_MAIN16], as.data.table(st_coordinates(grid_NSW)))
 
@@ -213,10 +221,23 @@ intersections[, id:= .I]
 smoke_pts_sa2 <- merge(smoke_pts[, -c('X', 'Y')], intersections, by = 'id', all.x = T)
 smoke_pts_sa2 <- merge(smoke_pts_sa2, non_smokey_baseline, by = 'id', all.x = T)
 
+# Baseline is NA when SA unit does not have a station in it - fill in with mean
+mean_non_smokey <- mean(non_smokey_baseline$non_smoky_weighted)
+smoke_pts_sa2[is.na(non_smoky_weighted), non_smoky_weighted:= mean_non_smokey]
+
 smoke_sa2 <- smoke_pts_sa2[, .(mean_weighted_smoke = mean(weighted_smoke), mean_weighted_non_smoke = mean(non_smoky_weighted)),
                            by = c('sa2_code', 'Date')]
 
-sa2_NSW <- merge(sa2_NSW, smoke_sa2, by.x = 'SA2_MAIN16', by.y = 'sa2_code')
+#### ---- For map ---- ####
+
+smoke_sa2_means_all_time <- smoke_sa2[,.(mean_smoke_all_time = mean(mean_weighted_smoke)), by = sa2_code]
+
+
+sa2_NSW_means <- merge(sa2_NSW, smoke_sa2_means_all_time, by.x = 'SA2_MAIN16', by.y = 'sa2_code')
+
+st_write(sa2_NSW_means, 'N:\\Perils20\\Climate\\Smoke\\Data\\Output\\SA2_NSW_Smoke.shp', delete_layer = T)
+
+sa2_NSW_by_day <- merge(sa2_NSW, smoke_sa2, by.x = 'SA2_MAIN16', by.y = 'sa2_code')
 
 ggplot(sa2_NSW, aes(colour = mean_weighted_smoke, fill = mean_weighted_smoke)) +
   geom_sf() +
@@ -235,7 +256,7 @@ ggplot(sa2_NSW, aes(colour = mean_weighted_smoke, fill = mean_weighted_smoke)) +
 # Attributable number = baseline incidence x (exp(beta * change in PM 2.5 concentration ) - 1) x Population
 
 # Get SA2 data into a non-spatial format
-sa2_NSW_DT <- as.data.table(sa2_NSW)
+sa2_NSW_DT <- as.data.table(sa2_NSW_by_day)
 sa2_NSW_DT[, geometry:= NULL]
 sa2_NSW_DT[, change:= mean_weighted_smoke - mean_weighted_non_smoke]
 sa2_NSW_DT[, SA2_MAIN16:= as.character(SA2_MAIN16)]
@@ -253,7 +274,7 @@ setnames(deaths_19_20, c('2019_Population', '2020_Population'), c('pop19', 'pop2
 
 beta_all_cause_mortality <- 0.0012
 
-sa2_NSW_DT <- merge(sa2_NSW_DT, deaths_19_20[, c('code', 'std_death_per_100k_per_day_19', 'std_death_per_100k_per_day_20', 
+sa2_NSW_DT <- merge(sa2_NSW_DT, deaths_19_20[, c('code', 'std_death_per_1000_per_day_19', 'std_death_per_1000_per_day_20', 
                                                  'pop19', 'pop20')], by.x = 'SA2_MAIN16', by.y = 'code', all.x = T)
 
 sa2_NSW_DT[Date <= as.Date("2019-12-31"), attr_death:= std_death_per_1000_per_day_19 * (exp(change * beta_all_cause_mortality) - 1) *
@@ -262,11 +283,15 @@ sa2_NSW_DT[Date <= as.Date("2019-12-31"), attr_death:= std_death_per_1000_per_da
 sa2_NSW_DT[Date > as.Date("2019-12-31"), attr_death:= std_death_per_1000_per_day_20 * (exp(change * beta_all_cause_mortality) - 1) * 
              pop20/1000]
 
-sa2_deaths <- sa2_NSW_DT[, .(deaths= sum(attr_death)), by = SA2_MAIN16]
-
-
+sa2_deaths <- sa2_NSW_DT[, .(deaths= sum(attr_death), pop = mean(pop20)), by = SA2_MAIN16]
+sa2_deaths[, deaths_per_10k:= (deaths/pop)*10000]
 
 sa2_deaths_sf <- merge(sa2_NSW, sa2_deaths, by = 'SA2_MAIN16')
+
+
+
+st_write(sa2_deaths_sf, 'N:\\Perils20\\Climate\\Smoke\\Data\\Output\\SA2_NSW_Deaths.shp', delete_layer = T)
+
 
 ggplot(sa2_deaths_sf, aes(colour = deaths, fill = deaths)) +
   geom_sf() +
@@ -278,4 +303,5 @@ ggplot(sa2_deaths_sf, aes(colour = deaths, fill = deaths)) +
   labs(colour = 'Deaths Attributable to Smoke Exposure \n(1 Nov 2019 - 29 Feb 2020)') +
   ggtitle("Deaths in Sydney Attributable to Smoke Exposure during the 2019/20 Bushfires") 
 
+ggsave("Sydney Smoke Deaths.png", device = png(), path = "C:\\Users\\emma.vitz\\Documents\\")
 
